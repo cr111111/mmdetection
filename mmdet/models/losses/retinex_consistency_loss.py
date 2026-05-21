@@ -15,8 +15,8 @@ All three terms are differentiable and can be logged individually for
 ablation analysis.
 """
 
-import torch
-import torch.nn as nn
+from typing import Dict
+
 import torch.nn.functional as F
 from mmengine.model import BaseModule
 from torch import Tensor
@@ -39,12 +39,11 @@ class RetinexConsistencyLoss(BaseModule):
     """Retinex physics-consistency loss.
 
     Args:
-        recon_weight (float): Weight for reconstruction loss. Default 1.0.
+        recon_weight (float): Weight for reconstruction loss. Defaults to 1.0.
         smooth_weight (float): Weight for illumination smoothness loss.
-            Default 0.5.
+            Defaults to 0.5.
         color_weight (float): Weight for reflectance colour consistency loss.
-            Default 0.1.
-        eps (float): Small constant for numerical stability. Default 1e-6.
+            Defaults to 0.1.
     """
 
     def __init__(
@@ -52,33 +51,34 @@ class RetinexConsistencyLoss(BaseModule):
         recon_weight: float = 1.0,
         smooth_weight: float = 0.5,
         color_weight: float = 0.1,
-        eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        self.recon_weight = recon_weight
-        self.smooth_weight = smooth_weight
-        self.color_weight = color_weight
-        self.eps = eps
+        self.recon_weight = float(recon_weight)
+        self.smooth_weight = float(smooth_weight)
+        self.color_weight = float(color_weight)
 
     def forward(
         self,
         I: Tensor,
         R: Tensor,
         L: Tensor,
-    ) -> dict:
+    ) -> Dict[str, Tensor]:
         """Compute Retinex consistency losses.
 
+        Each returned entry is already multiplied by its weight, so mmengine's
+        loss aggregation can sum them directly without double counting.
+
         Args:
-            I (Tensor): Original input image (B, 3, H, W).
-            R (Tensor): Predicted reflectance (B, 3, H, W).
-            L (Tensor): Predicted illumination (B, 3, H, W).
+            I (Tensor): Original input image ``(B, 3, H, W)`` in ``[0, 1]``.
+            R (Tensor): Predicted reflectance ``(B, 3, H, W)``.
+            L (Tensor): Predicted illumination ``(B, 3, H, W)``.
 
         Returns:
-            dict: Dictionary of loss tensors:
-                - loss_recon: Reconstruction loss.
-                - loss_smooth: Illumination smoothness loss.
-                - loss_color: Reflectance colour consistency loss.
-                - loss_retinex: Weighted sum of the above.
+            Dict[str, Tensor]: Dictionary with three weighted loss tensors
+
+            - ``loss_recon``: weighted reconstruction loss.
+            - ``loss_smooth``: weighted illumination smoothness loss.
+            - ``loss_color``: weighted reflectance colour consistency loss.
         """
         # 1. Reconstruction: ||I - R * L||_1
         recon = F.l1_loss(I, R * L)
@@ -89,17 +89,14 @@ class RetinexConsistencyLoss(BaseModule):
         smooth = (grad_x.abs().mean() + grad_y.abs().mean()) / 2.0
 
         # 3. Reflectance colour consistency: each channel should be close to
-        #    the channel mean (grey-world assumption for reflectance)
+        #    the channel mean (grey-world assumption for reflectance).
         R_mean = R.mean(dim=1, keepdim=True)  # (B, 1, H, W)
         color = F.l1_loss(R, R_mean.expand_as(R))
 
-        loss_retinex = (self.recon_weight * recon
-                        + self.smooth_weight * smooth
-                        + self.color_weight * color)
-
+        # Return per-term weighted losses; mmengine will sum them.
+        # We do NOT also return the aggregate to avoid double counting.
         return dict(
-            loss_recon=recon * self.recon_weight,
-            loss_smooth=smooth * self.smooth_weight,
-            loss_color=color * self.color_weight,
-            loss_retinex=loss_retinex,
+            loss_recon=self.recon_weight * recon,
+            loss_smooth=self.smooth_weight * smooth,
+            loss_color=self.color_weight * color,
         )
