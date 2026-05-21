@@ -44,7 +44,8 @@ def dct2(x: Tensor) -> Tensor:
     """Apply 2D Type-II DCT along the last two dimensions.
 
     Args:
-        x (Tensor): Input tensor of shape (..., H, W).
+        x (Tensor): Input tensor of shape ``(B, C, H, W)`` or
+            ``(..., H, W)``.
 
     Returns:
         Tensor: DCT coefficients of the same shape.
@@ -52,16 +53,20 @@ def dct2(x: Tensor) -> Tensor:
     H, W = x.shape[-2], x.shape[-1]
     basis_h = _dct_basis(H, x.device, x.dtype)  # (H, H)
     basis_w = _dct_basis(W, x.device, x.dtype)  # (W, W)
-    # DCT_2D = basis_h @ x @ basis_w^T
-    out = basis_h @ x @ basis_w.t()
-    return out
+    # Flatten leading dims so matmul broadcasts correctly.
+    leading = x.shape[:-2]  # (B, C, ...)
+    x_flat = x.reshape(-1, H, W)  # (N, H, W)
+    # DCT_2D = basis_h @ x @ basis_w^T  (per-matrix)
+    out = basis_h @ x_flat @ basis_w.t()  # (N, H, W)
+    return out.reshape(*leading, H, W)
 
 
 def idct2(x: Tensor) -> Tensor:
     """Apply 2D Type-III IDCT (inverse of dct2) along the last two dims.
 
     Args:
-        x (Tensor): DCT coefficients of shape (..., H, W).
+        x (Tensor): DCT coefficients of shape ``(B, C, H, W)`` or
+            ``(..., H, W)``.
 
     Returns:
         Tensor: Reconstructed spatial-domain signal of the same shape.
@@ -69,8 +74,10 @@ def idct2(x: Tensor) -> Tensor:
     H, W = x.shape[-2], x.shape[-1]
     basis_h = _dct_basis(H, x.device, x.dtype)  # orthogonal → inv = transpose
     basis_w = _dct_basis(W, x.device, x.dtype)
-    out = basis_h.t() @ x @ basis_w
-    return out
+    leading = x.shape[:-2]
+    x_flat = x.reshape(-1, H, W)
+    out = basis_h.t() @ x_flat @ basis_w  # (N, H, W)
+    return out.reshape(*leading, H, W)
 
 
 def freq_band_masks(

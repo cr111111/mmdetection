@@ -18,12 +18,13 @@ bands more.
 This is the second core contribution of Dark-DINO.
 """
 
+import math
 from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import ConvModule, build_activation_layer
+from mmcv.cnn import ConvModule
 from mmengine.model import BaseModule
 from torch import Tensor
 
@@ -31,6 +32,7 @@ from mmdet.registry import MODELS
 from mmdet.utils import OptConfigType, OptMultiConfig
 
 from ..utils.dct_utils import dct2, idct2, freq_band_masks
+from ..utils.mamba_block import MambaS6Block
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +75,8 @@ class LargeKernelConvBlock(BaseModule):
 class DeformableAttnBlock(BaseModule):
     """Simplified deformable attention for mid-band processing.
 
-    Uses a lightweight multi-head self-attention with learned offsets
-    (approximated with standard attention + spatial shift for efficiency).
+    Uses a lightweight multi-head self-attention with sinusoidal positional
+    encoding (no hardcoded spatial size) for efficiency.
 
     Args:
         channels (int): Number of channels.
@@ -91,7 +93,29 @@ class DeformableAttnBlock(BaseModule):
         self.qkv = nn.Linear(channels, channels * 3)
         self.proj = nn.Linear(channels, channels)
         self.norm = nn.LayerNorm(channels)
-        self.pe = nn.Parameter(torch.zeros(1, 64, 64, channels))  # positional encoding buffer
+
+    @staticmethod
+    def _sine_pe(h: int, w: int, channels: int,
+                 device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Generate 2D sinusoidal positional encoding ``(1, H, W, C)``."""
+        # Split channels evenly for y and x axes.
+        half = channels // 2
+        y_pos = torch.arange(h, device=device, dtype=dtype).unsqueeze(1)
+        x_pos = torch.arange(w, device=device, dtype=dtype).unsqueeze(1)
+        dim_y = torch.arange(0, half, 2, device=device, dtype=dtype)
+        dim_x = torch.arange(0, half, 2, device=device, dtype=dtype)
+        freq_y = 1.0 / (10000 ** (dim_y / half))
+        freq_x = 1.0 / (10000 ** (dim_x / half))
+        pe_y = y_pos * freq_y  # (h, half/2)
+        pe_x = x_pos * freq_x  # (w, half/2)
+        # Interleave sin/cos
+        pe_y = torch.stack([pe_y.sin(), pe_y.cos()], dim=-1).reshape(h, half)
+        pe_x = torch.stack([pe_x.sin(), pe_x.cos()], dim=-1).reshape(w, half)
+        pe = torch.cat([
+            pe_y.unsqueeze(1).expand(h, w, half),
+            pe_x.unsqueeze(0).expand(h, w, half),
+        ], dim=-1)  # (H, W, C)
+        return pe.unsqueeze(0)  # (1, H, W, C)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
@@ -100,13 +124,8 @@ class DeformableAttnBlock(BaseModule):
         x = x.permute(0, 2, 3, 1)  # (B, H, W, C)
         x = self.norm(x)
 
-        # Add positional encoding (crop or interpolate to match spatial size)
-        pe = self.pe[:, :H, :W, :]
-        if pe.shape[1] < H or pe.shape[2] < W:
-            pe = F.interpolate(
-                self.pe.permute(0, 3, 1, 2), size=(H, W),
-                mode='bilinear', align_corners=False
-            ).permute(0, 2, 3, 1)
+        # Add sinusoidal positional encoding (no spatial size limit).
+        pe = self._sine_pe(H, W, C, x.device, x.dtype)
         x = x + pe
 
         N = H * W
@@ -115,7 +134,6 @@ class DeformableAttnBlock(BaseModule):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
         q, k, v = qkv.unbind(0)
 
-        # Scaled dot-product attention (with chunking for memory efficiency)
         scale = self.head_dim ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
@@ -124,93 +142,6 @@ class DeformableAttnBlock(BaseModule):
         out = out.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
         return out + residual
-
-
-# ---------------------------------------------------------------------------
-# Mamba / S6 block for high-band (pure PyTorch, no external dependency)
-# ---------------------------------------------------------------------------
-class MambaBlock(BaseModule):
-    """Lightweight Selective State Space (S6) block for high-band processing.
-
-    This is a pure PyTorch implementation that approximates the Mamba S6
-    selective scan using a causal 1D convolution + gating mechanism.  It
-    operates on flattened spatial tokens (B, N, C) and is designed to suppress
-    noise while preserving sparse high-frequency structure.
-
-    Args:
-        channels (int): Number of channels.
-        d_state (int): SSM state expansion factor. Default 16.
-        d_conv (int): Local convolution width. Default 3.
-    """
-
-    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 3,
-                 init_cfg: OptMultiConfig = None) -> None:
-        super().__init__(init_cfg=init_cfg)
-        self.d_state = d_state
-        self.d_conv = d_conv
-
-        self.in_proj = nn.Linear(channels, channels * 2, bias=False)
-        self.conv1d = nn.Conv1d(
-            channels, channels, kernel_size=d_conv,
-            padding=d_conv - 1, groups=channels, bias=True)
-        self.x_proj = nn.Linear(channels, d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(d_state * 2, channels, bias=True)
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1).float().repeat(channels, 1)))
-        self.D = nn.Parameter(torch.ones(channels))
-        self.out_proj = nn.Linear(channels, channels, bias=False)
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward.
-
-        Args:
-            x (Tensor): (B, N, C) flattened feature tokens.
-
-        Returns:
-            Tensor: (B, N, C) processed tokens.
-        """
-        residual = x
-        B, N, C = x.shape
-
-        xz = self.in_proj(x)  # (B, N, 2C)
-        x_branch, z = xz.chunk(2, dim=-1)  # each (B, N, C)
-
-        # Causal conv
-        x_conv = x_branch.transpose(1, 2)  # (B, C, N)
-        x_conv = self.conv1d(x_conv)[:, :, :N]  # causal: truncate
-        x_conv = x_conv.transpose(1, 2)  # (B, N, C)
-        x_conv = F.silu(x_conv)
-
-        # SSM parameters
-        A = -torch.exp(self.A_log.float())  # (C, d_state) < 0
-        BC = self.x_proj(x_conv)  # (B, N, 2*d_state)
-        B_mat, C_mat = BC.chunk(2, dim=-1)  # each (B, N, d_state)
-        dt = F.softplus(self.dt_proj(BC))  # (B, N, C)
-
-        # Simplified SSM scan: y = D * x + sum over states (approximation)
-        # For a practical and stable implementation, we use the discrete
-        # recurrence: h_t = exp(A * dt_t) * h_{t-1} + B_t * x_t
-        #                y_t = C_t @ h_t + D * x_t
-        h = x.new_zeros(B, C, self.d_state)
-        ys = []
-        for t in range(N):
-            dt_t = dt[:, t, :].unsqueeze(-1)  # (B, C, 1)
-            dA = torch.exp(A * dt_t)  # (B, C, d_state)
-            B_t = B_mat[:, t, :].unsqueeze(1)  # (B, 1, d_state)
-            C_t = C_mat[:, t, :].unsqueeze(2)  # (B, d_state, 1)
-            x_t = x_conv[:, t, :].unsqueeze(-1)  # (B, C, 1)
-            h = dA * h + B_t * x_t  # (B, C, d_state)
-            y_t = (h @ C_t).squeeze(-1)  # (B, C)
-            ys.append(y_t)
-        y = torch.stack(ys, dim=1)  # (B, N, C)
-        y = y + self.D.unsqueeze(0).unsqueeze(0) * x_conv
-
-        # Gate and output
-        y = y * F.silu(z)
-        y = self.out_proj(y)
-        y = self.norm(y)
-
-        return y + residual
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +241,6 @@ class FreqDecoupledNeck(BaseModule):
         super().__init__(init_cfg=init_cfg)
         assert isinstance(in_channels, list)
 
-        if num_outs is None:
-            num_outs = len(in_channels)
         self.num_outs = num_outs
         self.low_ratio = low_ratio
         self.high_ratio = high_ratio
@@ -344,9 +273,11 @@ class FreqDecoupledNeck(BaseModule):
             LargeKernelConvBlock(out_channels) for _ in range(num_outs)])
         self.mid_experts = nn.ModuleList([
             DeformableAttnBlock(out_channels) for _ in range(num_outs)])
+        # High-band: reuse the standalone MambaS6Block (M4 fix)
         self.high_experts = nn.ModuleList([
-            MambaBlock(out_channels) if use_mamba
-            else nn.Sequential(nn.Linear(out_channels, out_channels), nn.ReLU())
+            MambaS6Block(channels=out_channels) if use_mamba
+            else nn.Sequential(
+                nn.Linear(out_channels, out_channels), nn.ReLU())
             for _ in range(num_outs)])
 
         # Brightness gate
@@ -385,16 +316,18 @@ class FreqDecoupledNeck(BaseModule):
 
         # 2. Compute global average illumination for the gate
         if light_map is not None:
+            # Per-sample mean, keeps batch dimension for proper gradient flow.
             brightness = light_map.mean(dim=(1, 2, 3), keepdim=False)  # (B,)
             brightness = brightness.unsqueeze(-1)  # (B, 1)
         elif light_tokens is not None:
             brightness = light_tokens.mean(dim=(1, 2), keepdim=False)  # (B,)
             brightness = brightness.unsqueeze(-1)  # (B, 1)
         else:
-            # Fallback: use feature statistics
+            # Fallback: average feature norm per sample (gradient-friendly).
             brightness = torch.stack(
-                [f.mean() for f in feats], dim=0).mean().unsqueeze(0)
-            brightness = brightness.unsqueeze(-1).expand(feats[0].size(0), 1)
+                [f.mean(dim=(1, 2, 3)) for f in feats], dim=0
+            ).mean(dim=0)  # (B,)
+            brightness = brightness.unsqueeze(-1)  # (B, 1)
 
         # 3. DCT decomposition + band-specific processing
         band_feats = []  # list of (low, mid, high) per level
@@ -420,15 +353,10 @@ class FreqDecoupledNeck(BaseModule):
             low_out = self.low_experts[lvl](low_band)
             mid_out = self.mid_experts[lvl](mid_band)
 
-            # High-band: Mamba expects (B, N, C)
-            if self.use_mamba:
-                high_flat = high_band.flatten(2).transpose(1, 2)  # (B, N, C)
-                high_out = self.high_experts[lvl](high_flat)
-                high_out = high_out.transpose(1, 2).reshape(B, C, H, W)
-            else:
-                high_flat = high_band.flatten(2).transpose(1, 2)
-                high_out = self.high_experts[lvl](high_flat)
-                high_out = high_out.transpose(1, 2).reshape(B, C, H, W)
+            # High-band: experts expect (B, N, C)
+            high_flat = high_band.flatten(2).transpose(1, 2)  # (B, N, C)
+            high_out = self.high_experts[lvl](high_flat)
+            high_out = high_out.transpose(1, 2).reshape(B, C, H, W)
 
             band_feats.append((low_out, mid_out, high_out))
 

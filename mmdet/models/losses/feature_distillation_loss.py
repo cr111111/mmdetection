@@ -127,13 +127,12 @@ class FeatureDistillationLoss(BaseModule):
                 loss_relation = loss_relation + rel_loss
 
         num_pairs = max(num_pairs, 1)
-        losses = {
+        # Return per-term weighted losses; mmengine will sum them.
+        # We do NOT also return the aggregate to avoid double counting.
+        return {
             'loss_distill_cosine': self.cosine_weight * loss_cosine / num_pairs,
             'loss_distill_relation': self.relation_weight * loss_relation / num_pairs,
         }
-        losses['loss_distill'] = losses['loss_distill_cosine'] + \
-            losses['loss_distill_relation']
-        return losses
 
     @staticmethod
     def _relation_matrix(x: Tensor) -> Tensor:

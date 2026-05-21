@@ -1,18 +1,11 @@
-# Dark-DINO ExDark dataset pipeline with low-light augmentation
+# Dark-DINO ExDark dataset pipeline
 #
 # This pipeline includes:
 # - Standard loading + flipping
 # - RandomChoiceResize (multi-scale)
-# - Low-light augmentation: random gamma, Poisson noise, ISO noise
 # - PackDetInputs
 
 __backend_args = None
-
-# Low-light augmentation (applied after standard transforms)
-low_light_aug = dict(
-    type='RandomGamma',  # custom or use mmcv ColorJitter
-    gamma_range=(0.5, 2.0),
-    prob=0.3)
 
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args=__backend_args),

@@ -204,6 +204,6 @@ class DiffPriorFPN(BaseModule):
         """Override to keep SD VAE frozen."""
         super().train(mode)
         # SD VAE should always be in eval mode
-        if hasattr(self, '_sd_vae') and self._sd_vae.vae is not None:
-            self._sd_vae.vae.eval()
+        if self._sd_vae is not None:
+            self._sd_vae.eval()
         return self
