@@ -29,6 +29,7 @@ from .grounding_dino import GroundingDINO
 from .htc import HybridTaskCascade
 from .kd_one_stage import KnowledgeDistillationSingleStageDetector
 from .lad import LAD
+from .low_contrast_deformable_detr import LowContrastDeformableDETR
 from .mask2former import Mask2Former
 from .mask_rcnn import MaskRCNN
 from .mask_scoring_rcnn import MaskScoringRCNN
@@ -71,5 +72,5 @@ __all__ = [
     'MaskFormer', 'DDOD', 'Mask2Former', 'SemiBaseDetector', 'SoftTeacher',
     'RTMDet', 'Detectron2Wrapper', 'CrowdDet', 'CondInst', 'BoxInst',
     'DetectionTransformer', 'ConditionalDETR', 'DINO', 'DABDETR', 'GLIP',
-    'DDQDETR', 'GroundingDINO'
+    'DDQDETR', 'GroundingDINO', 'LowContrastDeformableDETR'
 ]
