@@ -1,7 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from .dct_utils import dct2, freq_band_masks, idct2, split_freq_bands
+from .dinov2_teacher import DINOv2Teacher
 from .gaussian_target import (gather_feat, gaussian_radius,
                               gen_gaussian_target, get_local_maximum,
                               get_topk_from_heatmap, transpose_and_gather_feat)
+from .mamba_block import MambaS6Block
+from .sd_vae_prior import SDVAEPrior
 from .image import imrenormalize
 from .make_divisible import make_divisible
 # Disable yapf because it conflicts with isort.
@@ -22,6 +26,8 @@ from .vlfuse_helper import BertEncoderLayer, VLFuse, permute_and_flatten
 from .wbf import weighted_boxes_fusion
 
 __all__ = [
+    'dct2', 'idct2', 'freq_band_masks', 'split_freq_bands',
+    'DINOv2Teacher', 'MambaS6Block', 'SDVAEPrior',
     'gaussian_radius', 'gen_gaussian_target', 'make_divisible',
     'get_local_maximum', 'get_topk_from_heatmap', 'transpose_and_gather_feat',
     'interpolate_as', 'sigmoid_geometric_mean', 'gather_feat',

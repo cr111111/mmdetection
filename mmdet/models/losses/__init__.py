@@ -7,6 +7,8 @@ from .cross_entropy_loss import (CrossEntropyCustomLoss, CrossEntropyLoss,
                                  mask_cross_entropy)
 from .contrast_focal_loss import ContrastFocalLoss
 from .ddq_detr_aux_loss import DDQAuxLoss
+from .feature_distillation_loss import FeatureDistillationLoss
+from .retinex_consistency_loss import RetinexConsistencyLoss
 from .dice_loss import DiceLoss
 from .eqlv2_loss import EQLV2Loss
 from .focal_loss import FocalCustomLoss, FocalLoss, sigmoid_focal_loss
@@ -40,5 +42,6 @@ __all__ = [
     'KnowledgeDistillationKLDivLoss', 'SeesawLoss', 'DiceLoss', 'EQLV2Loss',
     'MarginL2Loss', 'MultiPosCrossEntropyLoss', 'L2Loss', 'TripletLoss',
     'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss',
-    'ContrastFocalLoss'
+    'ContrastFocalLoss', 'RetinexConsistencyLoss',
+    'FeatureDistillationLoss'
 ]
