@@ -4,11 +4,10 @@
 This module provides a pure PyTorch implementation of 2D Type-II DCT and its
 inverse (Type-III, aka IDCT), along with frequency-band slicing utilities
 used by the FreqDecoupledNeck.  The implementation follows the orthogonality-
-preserving formulation so that ``idct2(dct2(x)) ≈ x`` to machine precision.
+preserving formulation so that ``idct2(dct2(x)) ~ x`` to machine precision.
 
-Reference:
-    - https://arxiv.org/abs/cmp-lin/9906003  (DCT definition)
-    - M. R. Portnoff, "Short-time Fourier analysis of sampled signals"
+Key fix: band masks use smooth (soft) transitions instead of hard binary
+thresholds to avoid ringing artifacts in the reconstructed spatial bands.
 """
 
 import math
@@ -20,7 +19,7 @@ from torch import Tensor
 
 
 def _dct_basis(N: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-    """Build the N×N Type-II DCT basis matrix (orthogonal).
+    """Build the N x N Type-II DCT basis matrix (orthogonal).
 
     Args:
         N (int): Dimension size.
@@ -72,7 +71,7 @@ def idct2(x: Tensor) -> Tensor:
         Tensor: Reconstructed spatial-domain signal of the same shape.
     """
     H, W = x.shape[-2], x.shape[-1]
-    basis_h = _dct_basis(H, x.device, x.dtype)  # orthogonal → inv = transpose
+    basis_h = _dct_basis(H, x.device, x.dtype)  # orthogonal -> inv = transpose
     basis_w = _dct_basis(W, x.device, x.dtype)
     leading = x.shape[:-2]
     x_flat = x.reshape(-1, H, W)
@@ -87,13 +86,22 @@ def freq_band_masks(
     high_ratio: float = 0.75,
     device: torch.device = torch.device('cpu'),
     dtype: torch.dtype = torch.float32,
+    smooth_width: float = 0.05,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Generate binary masks for low / mid / high frequency bands in 2D DCT.
+    """Generate soft (smooth) masks for low / mid / high frequency bands in
+    2D DCT.
 
     The "radius" of each frequency coefficient is its normalised Euclidean
-    distance from the DC component at (0, 0):
+    distance from the DC component at (0, 0)::
 
         r(u, v) = sqrt((u/H)^2 + (v/W)^2)
+
+    Instead of hard binary thresholds, the masks use sigmoid transitions
+    of width ``smooth_width`` around ``low_ratio`` and ``high_ratio``.
+    This avoids ringing artifacts caused by sharp spectral cutoffs.
+
+    The three masks sum to 1 everywhere (partition of unity), so
+    ``low + mid + high = full spectrum``.
 
     Args:
         h (int): Spatial height.
@@ -102,18 +110,35 @@ def freq_band_masks(
         high_ratio (float): Normalised radius threshold above which is "high".
         device: Torch device.
         dtype: Torch dtype.
+        smooth_width (float): Width of the sigmoid transition band.
+            Smaller = sharper cutoff (approaches binary mask).
+            Larger = smoother but more spectral leakage between bands.
+            Default 0.05 (about 5% of the normalised radius range).
 
     Returns:
-        Tuple[Tensor, Tensor, Tensor]: Three (h, w) boolean masks
-            (low_mask, mid_mask, high_mask).
+        Tuple[Tensor, Tensor, Tensor]: Three ``(h, w)`` float masks
+            (low_mask, mid_mask, high_mask), each in ``[0, 1]``.
+            They sum to 1 at every position.
     """
     u = torch.arange(h, device=device, dtype=dtype).unsqueeze(1)  # (h, 1)
     v = torch.arange(w, device=device, dtype=dtype).unsqueeze(0)  # (1, w)
     radius = ((u / h) ** 2 + (v / w) ** 2).sqrt()  # (h, w)
 
-    low_mask = radius <= low_ratio
-    high_mask = radius > high_ratio
-    mid_mask = ~low_mask & ~high_mask
+    # Sigmoid-based soft masks.
+    # low_mask: 1 for r << low_ratio, 0 for r >> low_ratio
+    # high_mask: 0 for r << high_ratio, 1 for r >> high_ratio
+    # mid_mask = 1 - low_mask - high_mask  (partition of unity)
+    s = max(smooth_width, 1e-4)
+
+    low_mask = torch.sigmoid((low_ratio - radius) / s)
+    high_mask = torch.sigmoid((radius - high_ratio) / s)
+    mid_mask = 1.0 - low_mask - high_mask
+
+    # Clamp to [0, 1] for numerical safety.
+    low_mask = low_mask.clamp(0.0, 1.0)
+    mid_mask = mid_mask.clamp(0.0, 1.0)
+    high_mask = high_mask.clamp(0.0, 1.0)
+
     return low_mask, mid_mask, high_mask
 
 
@@ -121,6 +146,7 @@ def split_freq_bands(
     x: Tensor,
     low_ratio: float = 0.25,
     high_ratio: float = 0.75,
+    smooth_width: float = 0.05,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Decompose a feature map into three frequency bands via 2D DCT.
 
@@ -128,6 +154,7 @@ def split_freq_bands(
         x (Tensor): Feature map of shape (B, C, H, W).
         low_ratio (float): Low-band radius ratio.
         high_ratio (float): High-band radius ratio.
+        smooth_width (float): Sigmoid transition width for soft masks.
 
     Returns:
         Tuple of three tensors, each (B, C, H, W):
@@ -139,7 +166,8 @@ def split_freq_bands(
     coeffs = dct2(x)  # (B, C, H, W)
 
     low_mask, mid_mask, high_mask = freq_band_masks(
-        H, W, low_ratio, high_ratio, x.device, x.dtype)
+        H, W, low_ratio, high_ratio, x.device, x.dtype,
+        smooth_width=smooth_width)
 
     # Apply masks and inverse-DCT each band back to spatial domain
     bands = []

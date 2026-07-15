@@ -252,19 +252,25 @@ class DarkDINO(DINO):
         """Undo :class:`DetDataPreprocessor` normalisation, returning images
         in ``[0, 1]``.
 
+        The preprocessor applies ``x_norm = (x_rgb_255 - mean) / std``.
+        We invert as ``x_rgb_255 = x_norm * std + mean`` then scale to
+        ``[0, 1]``.
+
         Args:
-            x (Tensor): Normalised images ``(B, 3, H, W)``.
+            x (Tensor): Normalised images ``(B, 3, H, W)`` (RGB order).
 
         Returns:
-            Tensor: Images in ``[0, 1]``.
+            Tensor: Images in ``[0, 1]`` (RGB order).
         """
         dp = getattr(self, 'data_preprocessor', None)
         if dp is not None and hasattr(dp, 'mean') and dp.mean is not None:
             mean = dp.mean.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
-            x = x + mean
             if hasattr(dp, 'std') and dp.std is not None:
-                std = dp.std.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
-                x = x * std
+                std = dp.std.to(
+                    device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+                x = x * std + mean
+            else:
+                x = x + mean
         # Pixel range was [0, 255] before normalisation.
         return (x / 255.0).clamp(0.0, 1.0)
 

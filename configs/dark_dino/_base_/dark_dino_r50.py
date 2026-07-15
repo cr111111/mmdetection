@@ -1,4 +1,4 @@
-# Dark-DINO with R50 backbone — shared model skeleton
+# Dark-DINO with R50 backbone 鈥?shared model skeleton
 # This is the base config that other dark_dino configs inherit from.
 
 num_levels = 4
@@ -30,7 +30,9 @@ model = dict(
             in_channels=3,
             out_channels=256,
             num_tokens=4),
-        freeze_decomposer=False),
+        freeze_decomposer=False,
+        pp_mean=[123.675, 116.28, 103.53],
+        pp_std=[58.395, 57.12, 57.375]),
     neck=dict(
         type='FreqDecoupledNeck',
         in_channels=[512, 1024, 2048],

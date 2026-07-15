@@ -4,14 +4,14 @@
 This neck performs channel mapping (like ChannelMapper) and then decomposes
 each level's feature map into three frequency bands via 2D DCT:
     - **Low band** (DC + near-DC): processed by a large-kernel ConvNeXt block
-      to capture global structure — the dominant reliable cue in dark images.
+      to capture global structure 鈥?the dominant reliable cue in dark images.
     - **Mid band** (edges / contours): processed by a simplified Deformable
       Attention block that captures object-level structure.
     - **High band** (fine detail / noise): processed by a Mamba / S6 block
       that suppresses noise while preserving sparse high-frequency structure.
 
 The three bands are fused by a brightness-driven gate: the global average
-illumination (from the Retinex L component) controls the mixing weights —
+illumination (from the Retinex L component) controls the mixing weights 鈥?
 darker images rely more on low + mid bands, brighter images can trust high
 bands more.
 
@@ -70,10 +70,10 @@ class LargeKernelConvBlock(BaseModule):
 
 
 # ---------------------------------------------------------------------------
-# Simplified Deformable Attention block for mid-band
+# Multi-head self-attention block for mid-band
 # ---------------------------------------------------------------------------
-class DeformableAttnBlock(BaseModule):
-    """Simplified deformable attention for mid-band processing.
+class MidBandSelfAttention(BaseModule):
+    """Multi-head self-attention with sinusoidal positional encoding for mid-band processing.
 
     Uses a lightweight multi-head self-attention with sinusoidal positional
     encoding (no hardcoded spatial size) for efficiency.
@@ -151,8 +151,8 @@ class BrightnessGate(BaseModule):
     """Brightness-driven gate for fusing three frequency bands.
 
     The global average illumination (scalar per image) is fed through an MLP
-    to produce per-band mixing weights.  Darker images → more weight on
-    low + mid bands; brighter images → more weight on high band.
+    to produce per-band mixing weights.  Darker images 鈫?more weight on
+    low + mid bands; brighter images 鈫?more weight on high band.
 
     Args:
         out_channels (int): Channel dimension of the feature maps.
@@ -166,7 +166,7 @@ class BrightnessGate(BaseModule):
         self.gate_mlp = nn.Sequential(
             nn.Linear(1, 16),
             nn.ReLU(inplace=True),
-            nn.Linear(16, 3 * num_levels),  # 3 bands × num_levels
+            nn.Linear(16, 3 * num_levels),  # 3 bands 脳 num_levels
         )
 
     def forward(self, feats: List[Tensor],
@@ -205,7 +205,7 @@ class FreqDecoupledNeck(BaseModule):
 
     After channel mapping, each level's feature is decomposed via 2D DCT into
     low / mid / high frequency bands.  Each band is processed by a specialised
-    expert module (large-kernel conv / deformable attention / Mamba).  The
+    expert module (large-kernel conv / self-attention / Mamba).  The
     three bands are then fused by a brightness-driven gate.
 
     Args:
@@ -215,11 +215,13 @@ class FreqDecoupledNeck(BaseModule):
         num_outs (int): Number of output feature levels. Default 4.
         low_ratio (float): DCT low-band radius ratio. Default 0.25.
         high_ratio (float): DCT high-band radius ratio. Default 0.75.
+        smooth_width (float): Sigmoid transition width for soft band masks.
+            Smaller = sharper cutoff. Default 0.05.
         conv_cfg: Conv config for channel mapping.
         norm_cfg: Norm config for channel mapping.
         act_cfg: Activation config for channel mapping.
         use_mamba (bool): Whether to use Mamba for high-band. If False,
-            falls back to a simple 1×1 conv + ReLU. Default True.
+            falls back to a simple 1脳1 conv + ReLU. Default True.
         init_cfg: Initialization config.
     """
 
@@ -231,6 +233,7 @@ class FreqDecoupledNeck(BaseModule):
         num_outs: int = 4,
         low_ratio: float = 0.25,
         high_ratio: float = 0.75,
+        smooth_width: float = 0.05,
         conv_cfg: OptConfigType = None,
         norm_cfg: OptConfigType = dict(type='GN', num_groups=32),
         act_cfg: OptConfigType = None,
@@ -244,6 +247,7 @@ class FreqDecoupledNeck(BaseModule):
         self.num_outs = num_outs
         self.low_ratio = low_ratio
         self.high_ratio = high_ratio
+        self.smooth_width = smooth_width
         self.use_mamba = use_mamba
 
         # Channel-mapping convs (same as ChannelMapper)
@@ -272,7 +276,7 @@ class FreqDecoupledNeck(BaseModule):
         self.low_experts = nn.ModuleList([
             LargeKernelConvBlock(out_channels) for _ in range(num_outs)])
         self.mid_experts = nn.ModuleList([
-            DeformableAttnBlock(out_channels) for _ in range(num_outs)])
+            MidBandSelfAttention(out_channels) for _ in range(num_outs)])
         # High-band: reuse the standalone MambaS6Block (M4 fix)
         self.high_experts = nn.ModuleList([
             MambaS6Block(channels=out_channels) if use_mamba
@@ -338,7 +342,8 @@ class FreqDecoupledNeck(BaseModule):
             coeffs = dct2(feat)
             low_mask, mid_mask, high_mask = freq_band_masks(
                 H, W, self.low_ratio, self.high_ratio,
-                feat.device, feat.dtype)
+                feat.device, feat.dtype,
+                smooth_width=self.smooth_width)
 
             # Band-specific filtering + IDCT
             low_coeffs = coeffs * low_mask.unsqueeze(0).unsqueeze(0)

@@ -195,6 +195,15 @@ class RetinexDecomposedBackbone(BaseModule):
             :class:`IlluminationTokenEncoder`.  Defaults to 4 tokens / 256-d.
         freeze_decomposer (bool): If True, freeze the decomposition head
             (used in stage-2/3 after stage-1 pretraining). Defaults to False.
+        pp_mean (list[float]): Mean used by the detector's
+            DetDataPreprocessor (in RGB order, 0-255 scale).  Must match the
+            config so that _denormalize correctly inverts the normalisation.
+        pp_std (list[float]): Std used by the detector's
+            DetDataPreprocessor (in RGB order, 0-255 scale).
+        imagenet_mean (list[float]): ImageNet normalisation mean for
+            re-normalising R before feeding into the pretrained backbone.
+            Defaults to the standard ImageNet values.
+        imagenet_std (list[float]): ImageNet normalisation std.
         init_cfg (dict, optional): Initialization config.
     """
 
@@ -204,6 +213,10 @@ class RetinexDecomposedBackbone(BaseModule):
         decomposer: OptConfigType = None,
         light_encoder: OptConfigType = None,
         freeze_decomposer: bool = False,
+        pp_mean: list = [123.675, 116.28, 103.53],
+        pp_std: list = [58.395, 57.12, 57.375],
+        imagenet_mean: list = [0.485, 0.456, 0.406],
+        imagenet_std: list = [0.229, 0.224, 0.225],
         init_cfg: OptMultiConfig = None,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
@@ -220,6 +233,17 @@ class RetinexDecomposedBackbone(BaseModule):
         # Detection backbone (built from mmdet registry so that pretrained
         # weights are automatically loaded via init_cfg of the inner module).
         self.backbone = MODELS.build(backbone)
+
+        # Store preprocessor / ImageNet normalisation constants as buffers
+        # (non-trainable, move with .to(device)).
+        self.register_buffer(
+            '_pp_mean', torch.tensor(pp_mean, dtype=torch.float32))
+        self.register_buffer(
+            '_pp_std', torch.tensor(pp_std, dtype=torch.float32))
+        self.register_buffer(
+            '_imagenet_mean', torch.tensor(imagenet_mean, dtype=torch.float32))
+        self.register_buffer(
+            '_imagenet_std', torch.tensor(imagenet_std, dtype=torch.float32))
 
         self.freeze_decomposer = freeze_decomposer
         if freeze_decomposer:
@@ -238,7 +262,9 @@ class RetinexDecomposedBackbone(BaseModule):
         """Forward.
 
         Args:
-            x (Tensor): Input dark image ``(B, 3, H, W)``.
+            x (Tensor): Input dark image ``(B, 3, H, W)``.  This tensor is
+                already normalised by DetDataPreprocessor
+                (``(x - mean) / std``, approximately in ``[-2, 2]``).
 
         Returns:
             Tuple containing:
@@ -247,22 +273,56 @@ class RetinexDecomposedBackbone(BaseModule):
               detection backbone applied on R.
             - ``light_tokens`` (Tensor): ``(B, num_tokens, C)`` illumination
               tokens.
-            - ``R`` (Tensor): ``(B, 3, H, W)`` reflectance.
-            - ``L`` (Tensor): ``(B, 3, H, W)`` illumination.
+            - ``R`` (Tensor): ``(B, 3, H, W)`` reflectance in ``[0, 1]``.
+            - ``L`` (Tensor): ``(B, 3, H, W)`` illumination in ``[0, 1]``.
         """
-        # 1. Retinex decomposition
-        R, L = self.decomposer(x)
+        # 1. Undo preprocessor normalisation to obtain physical-domain image
+        #    in [0, 1].  Retinex decomposition (I = R * L) requires inputs in
+        #    the physical image domain so that R and L are well-defined.
+        I = self._denormalize(x)
 
-        # 2. Feed R into detection backbone (gradients flow back through R
-        #    into the decomposer, jointly trained with detection loss).
-        mlvl_feats = self.backbone(R)
+        # 2. Retinex decomposition on physical-domain image.
+        R, L = self.decomposer(I)
 
-        # 3. Encode L into tokens.  L is detached so that detection gradients
+        # 3. Feed R into detection backbone.  We re-normalise R back to the
+        #    ImageNet domain so that the pretrained ResNet sees the expected
+        #    input distribution.  Gradients flow through R into the decomposer.
+        R_norm = self._renormalize_imagenet(R)
+        mlvl_feats = self.backbone(R_norm)
+
+        # 4. Encode L into tokens.  L is detached so that detection gradients
         #    do not corrupt the illumination estimate; the Retinex
         #    consistency loss is the only supervisor of L.
         light_tokens = self.light_encoder(L.detach())
 
         return mlvl_feats, light_tokens, R, L
+
+    def _denormalize(self, x: Tensor) -> Tensor:
+        """Undo DetDataPreprocessor normalisation to get ``[0, 1]`` image.
+
+        The preprocessor applies ``(x_rgb - mean) / std`` where the original
+        pixel range is ``[0, 255]``.  We invert this to recover the RGB
+        image in ``[0, 1]``.
+        """
+        mean = self._pp_mean.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        std = self._pp_std.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        x = x * std + mean          # -> [0, 255]
+        return (x / 255.0).clamp(0.0, 1.0)
+
+    def _renormalize_imagenet(self, x: Tensor) -> Tensor:
+        """Re-apply ImageNet normalisation so pretrained backbone sees its
+        expected input distribution.
+
+        Args:
+            x (Tensor): Image in ``[0, 1]`` (RGB).
+        Returns:
+            Tensor: Normalised image in ImageNet domain.
+        """
+        mean = self._imagenet_mean.to(
+            device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        std = self._imagenet_std.to(
+            device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        return (x - mean) / std
 
     def train(self, mode: bool = True) -> 'RetinexDecomposedBackbone':
         """Override to keep frozen modules in eval mode.
